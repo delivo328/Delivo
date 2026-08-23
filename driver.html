@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>DELIVO Driver</title>
+<style>
+  html, body { margin:0; padding:0; background:#0A0A0B; }
+  * { box-sizing: border-box; }
+  ::-webkit-scrollbar { width:0; height:0; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+const GOLD = "linear-gradient(135deg,#F7D774 0%,#D9A62E 55%,#B87F14 100%)";
+const GOLD_SOLID = "#D9A62E";
+
+const FONT_IMPORT = `
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+`;
+
+// Coordonnées GPS approximatives des quartiers de Ouagadougou (WGS84)
+const ZONES = {
+  "Kossodo": { lat: 12.4103, lng: -1.4854 },
+  "Tanghin": { lat: 12.4030, lng: -1.5100 },
+  "Dassasgho": { lat: 12.3850, lng: -1.4700 },
+  "Gounghin": { lat: 12.3600, lng: -1.5300 },
+  "Ouaga 2000": { lat: 12.3200, lng: -1.4850 },
+  "Zogona": { lat: 12.3600, lng: -1.5000 },
+  "Patte d'Oie": { lat: 12.3500, lng: -1.5350 },
+  "Cissin": { lat: 12.3400, lng: -1.5550 },
+  "Somgandé": { lat: 12.4000, lng: -1.4950 },
+  "Pissy": { lat: 12.3550, lng: -1.5650 },
+};
+
+// Distance orthodromique réelle (formule de Haversine), en km
+function haversineKm(a, b) {
+  const R = 6371;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const s =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+}
+
+// Boîte englobante de toutes les zones, utilisée pour projeter les points sur la mini-carte
+function boundingBox(points) {
+  const lats = points.map((p) => p.lat), lngs = points.map((p) => p.lng);
+  return { minLat: Math.min(...lats), maxLat: Math.max(...lats), minLng: Math.min(...lngs), maxLng: Math.max(...lngs) };
+}
+function projectPoint(pt, box, w, h, pad = 24) {
+  const spanLat = box.maxLat - box.minLat || 0.001;
+  const spanLng = box.maxLng - box.minLng || 0.001;
+  const x = pad + ((pt.lng - box.minLng) / spanLng) * (w - pad * 2);
+  const y = h - pad - ((pt.lat - box.minLat) / spanLat) * (h - pad * 2); // lat inversée (nord en haut)
+  return { x, y };
+}
+
+const PACKAGE_TYPES = [
+  { id: "document", label: "Document", mult: 1.0, icon: "📄" },
+  { id: "standard", label: "Colis standard", mult: 1.3, icon: "📦" },
+  { id: "fragile", label: "Colis fragile", mult: 1.6, icon: "🍶" },
+  { id: "nourriture", label: "Nourriture", mult: 1.2, icon: "🍔" },
+];
+
+const STATUS_META = {
+  en_attente: { label: "En attente", color: "#D9A62E", step: 0 },
+  acceptee: { label: "Acceptée", color: "#4DA3FF", step: 1 },
+  en_cours: { label: "En livraison", color: "#4DA3FF", step: 2 },
+  livree: { label: "Livrée", color: "#4CC98A", step: 3 },
+  annulee: { label: "Annulée", color: "#E05555", step: -1 },
+};
+
+function distanceKm(a, b) {
+  const za = ZONES[a], zb = ZONES[b];
+  if (!za || !zb) return 3;
+  // +30% pour approximer la distance réelle par la route (vs. vol d'oiseau)
+  const d = haversineKm(za, zb) * 1.3;
+  return Math.max(1.2, Math.round(d * 10) / 10);
+}
+
+function computePrice(pickup, dropoff, packageId) {
+  const km = distanceKm(pickup, dropoff);
+  const mult = PACKAGE_TYPES.find((p) => p.id === packageId)?.mult || 1;
+  const raw = 500 + km * 150 * mult;
+  return { price: Math.round(raw / 50) * 50, km };
+}
+
+function uid(prefix) {
+  return prefix + "_" + Math.random().toString(36).slice(2, 9);
+}
+
+function timeAgo(iso) {
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "à l'instant";
+  if (s < 3600) return `il y a ${Math.floor(s / 60)} min`;
+  if (s < 86400) return `il y a ${Math.floor(s / 3600)} h`;
+  return `il y a ${Math.floor(s / 86400)} j`;
+}
+
+/* ---------------- storage helpers (localStorage — même appareil pour l'instant) ---------------- */
+async function loadShared(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+async function saveShared(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    console.error("storage set failed", e);
+  }
+}
+async function loadPersonal(key, fallback) {
+  return loadShared(key, fallback);
+}
+async function savePersonal(key, value) {
+  return saveShared(key, value);
+}
+
+
+/* ---------------- Icônes (sans dépendance externe) ---------------- */
+function makeTextIcon(char) {
+  return function Icon({ size = 20, color = "currentColor", style }) {
+    return (
+      <span style={{ fontSize: size, lineHeight: 1, color, display: "inline-flex", alignItems: "center", justifyContent: "center", width: size, height: size, ...style }}>
+        {char}
+      </span>
+    );
+  };
+}
+function makeEmojiIcon(char) {
+  return function Icon({ size = 20, style }) {
+    return (
+      <span style={{ fontSize: size, lineHeight: 1, display: "inline-flex", alignItems: "center", justifyContent: "center", width: size, height: size, ...style }}>
+        {char}
+      </span>
+    );
+  };
+}
+const Package = makeEmojiIcon("📦");
+const MapPin = makeEmojiIcon("📍");
+const Bike = makeEmojiIcon("🚲");
+const User = makeEmojiIcon("🧑");
+const Shield = makeEmojiIcon("🛡️");
+const Bell = makeEmojiIcon("🔔");
+const Clock = makeEmojiIcon("🕒");
+const CheckCircle2 = makeTextIcon("✓");
+const Circle = makeTextIcon("○");
+const LogOut = makeTextIcon("⎋");
+const Plus = makeTextIcon("+");
+const TrendingUp = makeEmojiIcon("📈");
+const ChevronRight = makeTextIcon("›");
+const X = makeTextIcon("×");
+const ArrowLeft = makeTextIcon("←");
+const Truck = makeEmojiIcon("🚚");
+const Wallet = makeEmojiIcon("👛");
+const UsersIcon = makeEmojiIcon("👥");
+const ClipboardList = makeEmojiIcon("📋");
+const Zap = makeEmojiIcon("⚡");
+const Phone = makeEmojiIcon("📞");
+const Send = makeTextIcon("➤");
+const MessageCircle = makeEmojiIcon("💬");
+
+
+function SpeedLines({ w = 60, align = "left" }) {
+  const widths = align === "left" ? [w, w * 0.66, w * 0.4] : [w * 0.4, w * 0.66, w];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: align === "left" ? "flex-start" : "flex-end" }}>
+      {widths.map((width, i) => (
+        <div key={i} style={{ height: 3, width, borderRadius: 2, background: GOLD, opacity: 1 - i * 0.15 }} />
+      ))}
+    </div>
+  );
+}
+
+function Logo({ size = 34 }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+      <div
+        style={{
+          width: size, height: size, borderRadius: 9, background: "#111",
+          border: "1px solid #2A2620", display: "flex", alignItems: "center",
+          justifyContent: "center", fontFamily: "'Oswald',sans-serif",
+          fontWeight: 700, fontSize: size * 0.5, color: "#F3F1E9",
+        }}
+      >
+        <span style={{ background: GOLD, WebkitBackgroundClip: "text", color: "transparent" }}>D</span>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", lineHeight: 1 }}>
+        <span style={{ fontFamily: "'Oswald',sans-serif", fontWeight: 600, fontSize: 20, letterSpacing: 0.5, color: "#F3F1E9" }}>
+          DELIV<span style={{ background: GOLD, WebkitBackgroundClip: "text", color: "transparent" }}>O</span>
+        </span>
+        <span style={{ fontFamily: "'Inter',sans-serif", fontWeight: 700, fontSize: size * 0.24, letterSpacing: 2, color: "#D9A62E", marginTop: 1 }}>
+          DRIVER
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function Badge({ status }) {
+  const meta = STATUS_META[status] || STATUS_META.en_attente;
+  return (
+    <span
+      style={{
+        fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999,
+        color: meta.color, background: meta.color + "1E", border: `1px solid ${meta.color}44`,
+        fontFamily: "'Inter',sans-serif", whiteSpace: "nowrap",
+      }}
+    >
+      {meta.label}
+    </span>
+  );
+}
+
+function GoldButton({ children, onClick, disabled, style, full }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        background: disabled ? "#3A3628" : GOLD,
+        color: "#141208",
+        border: "none",
+        borderRadius: 12,
+        padding: "13px 18px",
+        fontFamily: "'Inter',sans-serif",
+        fontWeight: 700,
+        fontSize: 14,
+        cursor: disabled ? "not-allowed" : "pointer",
+        width: full ? "100%" : undefined,
+        opacity: disabled ? 0.6 : 1,
+        letterSpacing: 0.2,
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function GhostButton({ children, onClick, style, full }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        background: "transparent",
+        color: "#F3F1E9",
+        border: "1px solid #2A2620",
+        borderRadius: 12,
+        padding: "13px 18px",
+        fontFamily: "'Inter',sans-serif",
+        fontWeight: 600,
+        fontSize: 14,
+        cursor: "pointer",
+        width: full ? "100%" : undefined,
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Card({ children, style, onClick }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        background: "#15141A",
+        border: "1px solid #221F17",
+        borderRadius: 16,
+        padding: 16,
+        cursor: onClick ? "pointer" : "default",
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Select({ label, value, onChange, options, placeholder }) {
+  return (
+    <label style={{ display: "block", marginBottom: 14 }}>
+      <div style={{ fontSize: 12, color: "#8D8878", marginBottom: 6, fontFamily: "'Inter',sans-serif", fontWeight: 600 }}>{label}</div>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          width: "100%", background: "#1B1A20", border: "1px solid #2A2620", borderRadius: 10,
+          padding: "12px 12px", color: "#F3F1E9", fontFamily: "'Inter',sans-serif", fontSize: 14, appearance: "none",
+        }}
+      >
+        <option value="">{placeholder}</option>
+        {options.map((o) => (
+          <option key={o} value={o}>{o}</option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function TextInput({ label, value, onChange, placeholder, type = "text" }) {
+  return (
+    <label style={{ display: "block", marginBottom: 14 }}>
+      <div style={{ fontSize: 12, color: "#8D8878", marginBottom: 6, fontFamily: "'Inter',sans-serif", fontWeight: 600 }}>{label}</div>
+      <input
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          width: "100%", background: "#1B1A20", border: "1px solid #2A2620", borderRadius: 10,
+          padding: "12px 12px", color: "#F3F1E9", fontFamily: "'Inter',sans-serif", fontSize: 14, boxSizing: "border-box",
+        }}
+      />
+    </label>
+  );
+}
+
+function BottomNav({ tabs, active, onChange }) {
+  return (
+    <div
+      style={{
+        position: "sticky", bottom: 0, display: "flex", background: "#0F0E12",
+        borderTop: "1px solid #221F17", padding: "8px 6px calc(8px + env(safe-area-inset-bottom))",
+      }}
+    >
+      {tabs.map((t) => {
+        const isActive = active === t.id;
+        return (
+          <button
+            key={t.id}
+            onClick={() => onChange(t.id)}
+            style={{
+              flex: 1, background: "transparent", border: "none", display: "flex",
+              flexDirection: "column", alignItems: "center", gap: 4, padding: "6px 0",
+              cursor: "pointer", color: isActive ? "#F0C24D" : "#66625A",
+            }}
+          >
+            <t.icon size={20} strokeWidth={isActive ? 2.4 : 1.8} />
+            <span style={{ fontSize: 10, fontFamily: "'Inter',sans-serif", fontWeight: isActive ? 700 : 500 }}>{t.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TopBar({ title, onBack, right }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "18px 18px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        {onBack && (
+          <button onClick={onBack} style={{ background: "none", border: "none", color: "#F3F1E9", cursor: "pointer", padding: 4 }}>
+            <ArrowLeft size={20} />
+          </button>
+        )}
+        <span style={{ fontFamily: "'Oswald',sans-serif", fontSize: 19, fontWeight: 600, color: "#F3F1E9", letterSpacing: 0.3 }}>{title}</span>
+      </div>
+      {right}
+    </div>
+  );
+}
+
+function EmptyState({ icon: Icon, text }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, padding: "48px 20px", color: "#66625A" }}>
+      <Icon size={30} strokeWidth={1.5} />
+      <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 13, textAlign: "center" }}>{text}</div>
+    </div>
+  );
+}
+
+function useLiveGeolocation(active, onUpdate) {
+  const [status, setStatus] = useState("idle"); // idle | requesting | active | denied | unsupported
+  useEffect(() => {
+    if (!active) { setStatus("idle"); return; }
+    if (!("geolocation" in navigator)) { setStatus("unsupported"); return; }
+    setStatus("requesting");
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        setStatus("active");
+        onUpdate({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          updatedAt: new Date().toISOString(),
+        });
+      },
+      (err) => {
+        setStatus(err.code === 1 ? "denied" : "unsupported");
+      },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 12000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [active]);
+  return status;
+}
+
+function LiveShareCard({ order, onLocationUpdate }) {
+  const [sharing, setSharing] = useState(false);
+  const status = useLiveGeolocation(sharing, (loc) => onLocationUpdate(order.id, loc));
+
+  const statusText = {
+    idle: "Position non partagée",
+    requesting: "Localisation en cours…",
+    active: "Position GPS en direct ✓",
+    denied: "Localisation refusée — autorisez l'accès dans votre navigateur",
+    unsupported: "GPS indisponible sur cet appareil",
+  }[status];
+
+  return (
+    <Card style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: sharing ? 10 : 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <MapPin size={16} color={status === "active" ? "#4CC98A" : GOLD_SOLID} />
+          <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 12.5, color: "#F3F1E9", fontWeight: 600 }}>Ma position en direct</span>
+        </div>
+        <button
+          onClick={() => setSharing((s) => !s)}
+          style={{
+            background: sharing ? "#241412" : "#1B1A20", border: `1px solid ${sharing ? "#4A2020" : "#2A2620"}`,
+            borderRadius: 999, padding: "6px 12px", fontFamily: "'Inter',sans-serif", fontSize: 11.5,
+            fontWeight: 700, color: sharing ? "#E05555" : "#F0C24D", cursor: "pointer",
+          }}
+        >
+          {sharing ? "Arrêter" : "Partager"}
+        </button>
+      </div>
+      {sharing && (
+        <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11.5, color: status === "active" ? "#4CC98A" : "#8D8878" }}>
+          {statusText}
+          {order.livreurLocation && status === "active" && (
+            <span> · précision ≈ {Math.round(order.livreurLocation.accuracy)} m</span>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+
+function MiniMap({ pickup, dropoff, liveLoc, height = 200 }) {
+  const pickupPt = ZONES[pickup], dropoffPt = ZONES[dropoff];
+  if (!pickupPt || !dropoffPt) return null;
+  const allPts = [pickupPt, dropoffPt, ...(liveLoc ? [liveLoc] : [])];
+  const box = boundingBox([...Object.values(ZONES), ...(liveLoc ? [liveLoc] : [])]);
+  const w = 300;
+  const pPick = projectPoint(pickupPt, box, w, height);
+  const pDrop = projectPoint(dropoffPt, box, w, height);
+  const pLive = liveLoc ? projectPoint(liveLoc, box, w, height) : null;
+
+  return (
+    <div style={{ width: "100%", borderRadius: 14, overflow: "hidden", border: "1px solid #221F17", background: "#111017" }}>
+      <svg viewBox={`0 0 ${w} ${height}`} width="100%" height={height} style={{ display: "block" }}>
+        <defs>
+          <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
+            <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#1C1A22" strokeWidth="1" />
+          </pattern>
+        </defs>
+        <rect width={w} height={height} fill="url(#grid)" />
+        <line x1={pPick.x} y1={pPick.y} x2={pDrop.x} y2={pDrop.y} stroke="#3A3628" strokeWidth="2" strokeDasharray="4 4" />
+        {/* pickup */}
+        <circle cx={pPick.x} cy={pPick.y} r="6" fill="#D9A62E" stroke="#0A0A0B" strokeWidth="2" />
+        <text x={pPick.x + 9} y={pPick.y + 4} fontSize="10" fill="#D9A62E" fontFamily="Inter,sans-serif" fontWeight="700">Retrait</text>
+        {/* dropoff */}
+        <circle cx={pDrop.x} cy={pDrop.y} r="6" fill="#F3F1E9" stroke="#0A0A0B" strokeWidth="2" />
+        <text x={pDrop.x + 9} y={pDrop.y + 4} fontSize="10" fill="#F3F1E9" fontFamily="Inter,sans-serif" fontWeight="700">Livraison</text>
+        {/* live courier */}
+        {pLive && (
+          <g>
+            <circle cx={pLive.x} cy={pLive.y} r="9" fill="#4CC98A" opacity="0.25">
+              <animate attributeName="r" values="7;13;7" dur="1.8s" repeatCount="indefinite" />
+              <animate attributeName="opacity" values="0.35;0.05;0.35" dur="1.8s" repeatCount="indefinite" />
+            </circle>
+            <circle cx={pLive.x} cy={pLive.y} r="6" fill="#4CC98A" stroke="#0A0A0B" strokeWidth="2" />
+          </g>
+        )}
+      </svg>
+    </div>
+  );
+}
+
+/* ---------------- Order timeline ---------------- */
+
+function OrderTimeline({ order }) {
+  const steps = ["en_attente", "acceptee", "en_cours", "livree"];
+  const currentStep = STATUS_META[order.status]?.step ?? 0;
+  if (order.status === "annulee") {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#E05555", fontFamily: "'Inter',sans-serif", fontSize: 13 }}>
+        <X size={16} /> Commande annulée
+      </div>
+    );
+  }
+  const labels = { en_attente: "Commande reçue", acceptee: "Livreur assigné", en_cours: "En route", livree: "Livrée" };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+      {steps.map((s, i) => {
+        const done = i <= currentStep;
+        return (
+          <div key={s} style={{ display: "flex", gap: 12 }}>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+              {done ? <CheckCircle2 size={18} color={GOLD_SOLID} /> : <Circle size={18} color="#3A3628" />}
+              {i < steps.length - 1 && <div style={{ width: 2, flex: 1, minHeight: 22, background: i < currentStep ? GOLD_SOLID : "#221F17" }} />}
+            </div>
+            <div style={{ paddingBottom: 20 }}>
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 13, fontWeight: 600, color: done ? "#F3F1E9" : "#66625A" }}>{labels[s]}</div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------------- Login ---------------- */
+
+/* ---------------- Login (livreur) ---------------- */
+function LoginScreen({ onLogin }) {
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+
+  return (
+    <div style={{ minHeight: "100%", display: "flex", flexDirection: "column", padding: "40px 22px" }}>
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 6 }}>
+        <Logo size={44} />
+      </div>
+      <div style={{ textAlign: "center", color: "#8D8878", fontFamily: "'Inter',sans-serif", fontSize: 13, marginBottom: 30 }}>
+        Roulez. Livrez. Gagnez.
+      </div>
+      <div style={{ display: "flex", justifyContent: "center", marginBottom: 30 }}>
+        <SpeedLines w={50} align="left" />
+      </div>
+
+      <TextInput label="Nom complet" value={name} onChange={setName} placeholder="Ex : Mohamed Ouédraogo" />
+      <TextInput label="Téléphone" value={phone} onChange={setPhone} placeholder="Ex : 70 00 00 00" type="tel" />
+      <GoldButton
+        full
+        disabled={!name.trim() || !phone.trim()}
+        onClick={() => onLogin("livreur", name.trim(), phone.trim())}
+        style={{ marginTop: 6 }}
+      >
+        Continuer
+      </GoldButton>
+      <div style={{ textAlign: "center", fontSize: 11, color: "#4A4740", marginTop: 14, fontFamily: "'Inter',sans-serif" }}>
+        Prototype — aucune donnée réelle n'est requise
+      </div>
+    </div>
+  );
+}
+
+
+function OrderCard({ order, onClick }) {
+  const pkgMeta = PACKAGE_TYPES.find((p) => p.id === order.pkg);
+  return (
+    <Card onClick={onClick} style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 18 }}>{pkgMeta?.icon}</span>
+          <span style={{ fontFamily: "'Inter',sans-serif", fontWeight: 700, fontSize: 13, color: "#F3F1E9" }}>#{order.id.slice(-5).toUpperCase()}</span>
+        </div>
+        <Badge status={order.status} />
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontFamily: "'Inter',sans-serif", fontSize: 12.5, color: "#C9C5B8", marginBottom: 4 }}>
+        <MapPin size={12} color={GOLD_SOLID} /> {order.pickup} <ChevronRight size={11} color="#66625A" /> {order.dropoff}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+        <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: "#66625A" }}>{timeAgo(order.createdAt)}</span>
+        <span style={{ fontFamily: "'Oswald',sans-serif", fontSize: 15, color: "#F0C24D" }}>{order.price.toLocaleString()} FCFA</span>
+      </div>
+    </Card>
+  );
+}
+
+
+function ChatScreen({ order, session, onBack, onSend }) {
+  const [text, setText] = useState("");
+  const scrollRef = useRef(null);
+  const messages = order.messages || [];
+  const otherName = session.role === "client" ? order.livreurName : order.clientName;
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 999999, behavior: "smooth" });
+  }, [messages.length]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <TopBar title={otherName || "Discussion"} onBack={onBack} />
+      <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "0 18px", display: "flex", flexDirection: "column", gap: 8 }}>
+        {messages.length === 0 ? (
+          <div style={{ textAlign: "center", color: "#66625A", fontFamily: "'Inter',sans-serif", fontSize: 12.5, marginTop: 30 }}>
+            Aucun message pour l'instant. Dites bonjour 👋
+          </div>
+        ) : (
+          messages.map((m) => {
+            const mine = m.senderId === session.id;
+            return (
+              <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "78%" }}>
+                <div
+                  style={{
+                    background: mine ? GOLD : "#1B1A20", color: mine ? "#141208" : "#F3F1E9",
+                    borderRadius: 14, borderBottomRightRadius: mine ? 4 : 14, borderBottomLeftRadius: mine ? 14 : 4,
+                    padding: "9px 12px", fontFamily: "'Inter',sans-serif", fontSize: 13.5,
+                  }}
+                >
+                  {m.text}
+                </div>
+                <div style={{ fontSize: 10, color: "#66625A", marginTop: 3, textAlign: mine ? "right" : "left", fontFamily: "'Inter',sans-serif" }}>
+                  {timeAgo(m.time)}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 8, padding: "12px 18px", borderTop: "1px solid #221F17" }}>
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && text.trim()) { onSend(text.trim()); setText(""); } }}
+          placeholder="Écrire un message…"
+          style={{
+            flex: 1, background: "#1B1A20", border: "1px solid #2A2620", borderRadius: 999,
+            padding: "11px 16px", color: "#F3F1E9", fontFamily: "'Inter',sans-serif", fontSize: 13.5, outline: "none",
+          }}
+        />
+        <button
+          onClick={() => { if (text.trim()) { onSend(text.trim()); setText(""); } }}
+          disabled={!text.trim()}
+          style={{
+            background: text.trim() ? GOLD : "#3A3628", border: "none", borderRadius: "50%",
+            width: 42, height: 42, display: "flex", alignItems: "center", justifyContent: "center", cursor: text.trim() ? "pointer" : "not-allowed",
+          }}
+        >
+          <Send size={17} color="#141208" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+function OrderDetail({ order, role, onBack, onAccept, onAdvance, onCancel, onLocationUpdate, onOpenChat }) {
+  const pkgMeta = PACKAGE_TYPES.find((p) => p.id === order.pkg);
+  const trackable = order.status === "acceptee" || order.status === "en_cours";
+  const liveLoc = order.livreurLocation;
+  const distToDrop = liveLoc && ZONES[order.dropoff] ? Math.round(haversineKm(liveLoc, ZONES[order.dropoff]) * 1.3 * 10) / 10 : null;
+  const contactPhone = role === "client" ? order.livreurPhone : order.clientPhone;
+  const contactName = role === "client" ? order.livreurName : order.clientName;
+  const canContact = (order.status === "acceptee" || order.status === "en_cours" || order.status === "livree") && contactPhone;
+
+  return (
+    <div>
+      <TopBar title={`Commande #${order.id.slice(-5).toUpperCase()}`} onBack={onBack} right={<Badge status={order.status} />} />
+      <div style={{ padding: "0 18px 24px" }}>
+        <Card style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+            <div style={{ display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 3 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 4, background: GOLD_SOLID }} />
+              <div style={{ width: 2, flex: 1, minHeight: 24, background: "#2A2620" }} />
+              <div style={{ width: 8, height: 8, borderRadius: 4, background: "#F3F1E9" }} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 13, color: "#F3F1E9", fontWeight: 600, marginBottom: 18 }}>{order.pickup}</div>
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 13, color: "#F3F1E9", fontWeight: 600 }}>{order.dropoff}</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", borderTop: "1px solid #221F17", paddingTop: 12 }}>
+            <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#8D8878" }}>{pkgMeta?.icon} {pkgMeta?.label} · {order.km} km (route)</span>
+            <span style={{ fontFamily: "'Oswald',sans-serif", fontSize: 16, color: "#F0C24D" }}>{order.price.toLocaleString()} FCFA</span>
+          </div>
+          {order.note && (
+            <div style={{ marginTop: 10, fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#8D8878" }}>Note : {order.note}</div>
+          )}
+        </Card>
+
+        {canContact && (
+          <Card style={{ marginBottom: 16, display: "flex", flexDirection: "row", alignItems: "center", gap: 12 }}>
+            <div style={{ width: 40, height: 40, borderRadius: 20, background: GOLD, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <span style={{ fontFamily: "'Oswald',sans-serif", fontWeight: 700, fontSize: 16, color: "#141208" }}>
+                {(contactName || "?").charAt(0).toUpperCase()}
+              </span>
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 13, fontWeight: 700, color: "#F3F1E9", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {contactName}
+              </div>
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: "#66625A" }}>
+                {role === "client" ? "Votre livreur" : "Votre client"}
+              </div>
+            </div>
+            <a href={`tel:${contactPhone}`} style={{ textDecoration: "none" }}>
+              <div style={{ width: 38, height: 38, borderRadius: 12, background: "#1B1A20", border: "1px solid #2A2620", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+                <Phone size={16} color="#4CC98A" />
+              </div>
+            </a>
+            <button onClick={onOpenChat} style={{ width: 38, height: 38, borderRadius: 12, background: "#1B1A20", border: "1px solid #2A2620", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
+              <MessageCircle size={16} color={GOLD_SOLID} />
+            </button>
+          </Card>
+        )}
+
+        {trackable && (
+          <>
+            {role === "livreur" && <LiveShareCard order={order} onLocationUpdate={onLocationUpdate} />}
+            {role !== "livreur" && liveLoc && (
+              <Card style={{ marginBottom: 16, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#F3F1E9", fontWeight: 600 }}>Livreur en direct</div>
+                  <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 11, color: "#66625A" }}>
+                    {distToDrop != null ? `à ~${distToDrop} km de l'arrivée` : "position en cours"} · maj {timeAgo(liveLoc.updatedAt)}
+                  </div>
+                </div>
+                <div style={{ width: 10, height: 10, borderRadius: 5, background: "#4CC98A" }} />
+              </Card>
+            )}
+            {role !== "livreur" && !liveLoc && (
+              <Card style={{ marginBottom: 16 }}>
+                <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#8D8878" }}>
+                  Le livreur n'a pas encore activé le partage de sa position en direct.
+                </div>
+              </Card>
+            )}
+            <div style={{ marginBottom: 16 }}>
+              <MiniMap pickup={order.pickup} dropoff={order.dropoff} liveLoc={liveLoc} />
+            </div>
+          </>
+        )}
+
+        <Card style={{ marginBottom: 16 }}>
+          <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, fontWeight: 700, color: "#8D8878", marginBottom: 12 }}>SUIVI</div>
+          <OrderTimeline order={order} />
+        </Card>
+
+        {role === "livreur" && order.status === "en_attente" && (
+          <GoldButton full onClick={onAccept}>Accepter cette livraison</GoldButton>
+        )}
+        {role === "livreur" && order.status === "acceptee" && (
+          <GoldButton full onClick={() => onAdvance("en_cours")}>Marquer "en route"</GoldButton>
+        )}
+        {role === "livreur" && order.status === "en_cours" && (
+          <GoldButton full onClick={() => onAdvance("livree")}>Marquer comme livrée</GoldButton>
+        )}
+        {role === "client" && order.status === "en_attente" && (
+          <GhostButton full onClick={onCancel} style={{ color: "#E05555", borderColor: "#4A2020" }}>Annuler la commande</GhostButton>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function ProfileScreen({ user, onLogout, extra }) {
+  return (
+    <div style={{ padding: "0 18px 24px" }}>
+      <Card style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 18 }}>
+        <div style={{ width: 52, height: 52, borderRadius: 26, background: GOLD, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Oswald',sans-serif", fontWeight: 700, fontSize: 20, color: "#141208" }}>
+          {user.name.charAt(0).toUpperCase()}
+        </div>
+        <div>
+          <div style={{ fontFamily: "'Inter',sans-serif", fontWeight: 700, fontSize: 15, color: "#F3F1E9" }}>{user.name}</div>
+          <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#8D8878", display: "flex", alignItems: "center", gap: 4 }}>
+            <Phone size={11} /> {user.phone}
+          </div>
+        </div>
+      </Card>
+      {extra}
+      <GhostButton full onClick={onLogout} style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, color: "#E05555", borderColor: "#4A2020" }}>
+        <LogOut size={15} /> Se déconnecter
+      </GhostButton>
+    </div>
+  );
+}
+
+
+function LivreurApp({ user, orders, notifications, onAccept, onAdvance, onLogout, onLocationUpdate, onSendMessage }) {
+  const [tab, setTab] = useState("dispo");
+  const [selected, setSelected] = useState(null);
+  const [chatOrder, setChatOrder] = useState(null);
+
+  const available = useMemo(() => orders.filter((o) => o.status === "en_attente"), [orders]);
+  const mine = useMemo(
+    () => orders.filter((o) => o.livreurId === user.id).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+    [orders, user.id]
+  );
+  const active = mine.filter((o) => o.status === "acceptee" || o.status === "en_cours");
+  const done = mine.filter((o) => o.status === "livree");
+  const earnings = done.reduce((sum, o) => sum + Math.round(o.price * 0.8), 0);
+  const myNotifs = useMemo(
+    () => notifications.filter((n) => n.targetUserId === user.id).sort((a, b) => new Date(b.time) - new Date(a.time)),
+    [notifications, user.id]
+  );
+
+  if (chatOrder) {
+    const order = orders.find((o) => o.id === chatOrder.id) || chatOrder;
+    return (
+      <ChatScreen
+        order={order}
+        session={user}
+        onBack={() => setChatOrder(null)}
+        onSend={(text) => onSendMessage(order.id, text)}
+      />
+    );
+  }
+
+  if (selected) {
+    const order = orders.find((o) => o.id === selected.id) || selected;
+    return (
+      <OrderDetail
+        order={order}
+        role="livreur"
+        onBack={() => setSelected(null)}
+        onAccept={() => { onAccept(order.id); setSelected({ ...order, status: "acceptee", livreurId: user.id }); }}
+        onAdvance={(status) => { onAdvance(order.id, status); setSelected({ ...order, status }); }}
+        onLocationUpdate={onLocationUpdate}
+        onOpenChat={() => setChatOrder(order)}
+      />
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+      <TopBar title={tab === "dispo" ? "Courses disponibles" : tab === "livraisons" ? "Mes livraisons" : tab === "gains" ? "Mes gains" : "Profil"} right={<Logo size={26} />} />
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {tab === "dispo" && (
+          <div style={{ padding: "0 18px 24px" }}>
+            {active.length > 0 && (
+              <Card style={{ marginBottom: 14, background: "#141319", display: "flex", alignItems: "center", gap: 10 }}>
+                <Bike size={18} color={GOLD_SOLID} />
+                <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 12.5, color: "#F3F1E9" }}>
+                  {active.length} livraison{active.length > 1 ? "s" : ""} en cours
+                </span>
+              </Card>
+            )}
+            {available.length === 0 ? (
+              <EmptyState icon={Package} text="Aucune course disponible pour le moment." />
+            ) : (
+              available.map((o) => <OrderCard key={o.id} order={o} onClick={() => setSelected(o)} />)
+            )}
+          </div>
+        )}
+        {tab === "livraisons" && (
+          <div style={{ padding: "0 18px 24px" }}>
+            {mine.length === 0 ? (
+              <EmptyState icon={Bike} text="Vous n'avez pas encore de livraison assignée." />
+            ) : (
+              mine.map((o) => <OrderCard key={o.id} order={o} onClick={() => setSelected(o)} />)
+            )}
+          </div>
+        )}
+        {tab === "gains" && (
+          <div style={{ padding: "0 18px 24px" }}>
+            <Card style={{ marginBottom: 16, textAlign: "center", padding: "24px 16px" }}>
+              <Wallet size={22} color={GOLD_SOLID} style={{ marginBottom: 8 }} />
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#8D8878" }}>Gains cumulés (80% du prix course)</div>
+              <div style={{ fontFamily: "'Oswald',sans-serif", fontSize: 30, color: "#F0C24D", marginTop: 4 }}>{earnings.toLocaleString()} FCFA</div>
+              <div style={{ fontFamily: "'Inter',sans-serif", fontSize: 12, color: "#66625A", marginTop: 6 }}>{done.length} livraison{done.length !== 1 ? "s" : ""} terminée{done.length !== 1 ? "s" : ""}</div>
+            </Card>
+            {done.map((o) => <OrderCard key={o.id} order={o} onClick={() => setSelected(o)} />)}
+          </div>
+        )}
+        {tab === "profile" && <ProfileScreen user={user} onLogout={onLogout} />}
+      </div>
+      <BottomNav
+        active={tab}
+        onChange={setTab}
+        tabs={[
+          { id: "dispo", label: "Dispo.", icon: Package },
+          { id: "livraisons", label: "Livraisons", icon: Bike },
+          { id: "gains", label: "Gains", icon: Wallet },
+          { id: "profile", label: "Profil", icon: User },
+        ]}
+      />
+    </div>
+  );
+}
+
+/* ---------------- Admin space ---------------- */
+
+/* ---------------- Root App (Livreur / DELIVO Driver) ---------------- */
+function DelivoDriverApp() {
+  const [session, setSession] = useState(undefined);
+  const [orders, setOrders] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const [s, o, n] = await Promise.all([
+        loadPersonal("delivo:session:livreur", null),
+        loadShared("delivo:orders", []),
+        loadShared("delivo:notifications", []),
+      ]);
+      setSession(s);
+      setOrders(o);
+      setNotifications(n);
+      setReady(true);
+    })();
+  }, []);
+
+  const pushNotification = useCallback((targetUserId, message) => {
+    setNotifications((prev) => {
+      const next = [...prev, { id: uid("notif"), targetUserId, message, time: new Date().toISOString() }];
+      saveShared("delivo:notifications", next);
+      return next;
+    });
+  }, []);
+
+  const handleLogin = useCallback(async (role, name, phone) => {
+    const id = "livreur_" + phone.replace(/\s+/g, "");
+    const users = await loadShared("delivo:users", []);
+    const existing = users.find((u) => u.id === id);
+    const user = existing || { id, role: "livreur", name, phone };
+    if (!existing) await saveShared("delivo:users", [...users, user]);
+    setSession(user);
+    await savePersonal("delivo:session:livreur", user);
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    setSession(null);
+    await savePersonal("delivo:session:livreur", null);
+  }, []);
+
+  const handleAccept = useCallback((orderId) => {
+    setOrders((prev) => {
+      const next = prev.map((o) => o.id === orderId ? { ...o, status: "acceptee", livreurId: session.id, livreurName: session.name, livreurPhone: session.phone } : o);
+      saveShared("delivo:orders", next);
+      const order = prev.find((o) => o.id === orderId);
+      if (order) pushNotification(order.clientId, `${session.name} a accepté votre commande #${orderId.slice(-5).toUpperCase()}.`);
+      return next;
+    });
+  }, [session, pushNotification]);
+
+  const handleAdvance = useCallback((orderId, status) => {
+    setOrders((prev) => {
+      const next = prev.map((o) => o.id === orderId ? { ...o, status } : o);
+      saveShared("delivo:orders", next);
+      const order = prev.find((o) => o.id === orderId);
+      if (order) {
+        const msg = status === "en_cours" ? "Votre livreur est en route." : "Votre colis a été livré 🎉";
+        pushNotification(order.clientId, `${msg} (#${orderId.slice(-5).toUpperCase()})`);
+      }
+      return next;
+    });
+  }, [pushNotification]);
+
+  const handleSendMessage = useCallback((orderId, text) => {
+    setOrders((prev) => {
+      const next = prev.map((o) => {
+        if (o.id !== orderId) return o;
+        const msg = { id: uid("msg"), senderId: session.id, senderName: session.name, senderRole: "livreur", text, time: new Date().toISOString() };
+        return { ...o, messages: [...(o.messages || []), msg] };
+      });
+      saveShared("delivo:orders", next);
+      const order = prev.find((o) => o.id === orderId);
+      if (order) pushNotification(order.clientId, `${session.name} : ${text.length > 40 ? text.slice(0, 40) + "…" : text}`);
+      return next;
+    });
+  }, [session, pushNotification]);
+
+  const handleLocationUpdate = useCallback((orderId, loc) => {
+    setOrders((prev) => {
+      const next = prev.map((o) => o.id === orderId ? { ...o, livreurLocation: loc } : o);
+      saveShared("delivo:orders", next);
+      return next;
+    });
+  }, []);
+
+  // Rafraîchit les commandes régulièrement pour voir les nouvelles courses créées côté client
+  useEffect(() => {
+    if (!session) return;
+    const id = setInterval(async () => {
+      setOrders(await loadShared("delivo:orders", []));
+      setNotifications(await loadShared("delivo:notifications", []));
+    }, 3000);
+    return () => clearInterval(id);
+  }, [session]);
+
+  const shellStyle = {
+    maxWidth: 430, margin: "0 auto", minHeight: "100vh", background: "#0A0A0B",
+    fontFamily: "'Inter',sans-serif", display: "flex", flexDirection: "column",
+    position: "relative", boxShadow: "0 0 60px rgba(0,0,0,0.5)",
+  };
+
+  if (!ready) {
+    return (
+      <div style={{ ...shellStyle, alignItems: "center", justifyContent: "center" }}>
+        <style>{FONT_IMPORT}</style>
+        <Logo size={40} />
+      </div>
+    );
+  }
+
+  return (
+    <div style={shellStyle}>
+      <style>{FONT_IMPORT}{`
+        * { box-sizing: border-box; }
+        ::-webkit-scrollbar { width: 0; height: 0; }
+      `}</style>
+      {!session ? (
+        <LoginScreen onLogin={handleLogin} />
+      ) : (
+        <LivreurApp
+          user={session}
+          orders={orders}
+          notifications={notifications}
+          onAccept={handleAccept}
+          onAdvance={handleAdvance}
+          onLogout={handleLogout}
+          onLocationUpdate={handleLocationUpdate}
+          onSendMessage={handleSendMessage}
+        />
+      )}
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<DelivoDriverApp />);
+
+</script>
+</body>
+</html>
