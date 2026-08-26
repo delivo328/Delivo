@@ -4,13 +4,29 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <title>DELIVO Driver</title>
+<link rel="manifest" href="./driver-manifest.webmanifest" />
+<meta name="theme-color" content="#0A0A0B" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="DELIVO Driver" />
+<link rel="apple-touch-icon" href="./driver-icon-192.png" />
+<link rel="icon" href="./driver-icon-192.png" />
 <style>
   html, body { margin:0; padding:0; background:#0A0A0B; }
   * { box-sizing: border-box; }
   ::-webkit-scrollbar { width:0; height:0; }
+  @keyframes delivoPulse {
+    0% { box-shadow: 0 0 0 0 rgba(76,201,138,0.5); }
+    70% { box-shadow: 0 0 0 14px rgba(76,201,138,0); }
+    100% { box-shadow: 0 0 0 0 rgba(76,201,138,0); }
+  }
+  .leaflet-container { background: #1a1a1a; font-family: 'Inter', sans-serif; }
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
@@ -487,48 +503,81 @@ function LiveShareCard({ order, onLocationUpdate }) {
 }
 
 
-function MiniMap({ pickup, dropoff, liveLoc, height = 200 }) {
-  const pickupPt = ZONES[pickup], dropoffPt = ZONES[dropoff];
-  if (!pickupPt || !dropoffPt) return null;
-  const allPts = [pickupPt, dropoffPt, ...(liveLoc ? [liveLoc] : [])];
-  const box = boundingBox([...Object.values(ZONES), ...(liveLoc ? [liveLoc] : [])]);
-  const w = 300;
-  const pPick = projectPoint(pickupPt, box, w, height);
-  const pDrop = projectPoint(dropoffPt, box, w, height);
-  const pLive = liveLoc ? projectPoint(liveLoc, box, w, height) : null;
+function MiniMap({ pickup, dropoff, liveLoc, height = 220 }) {
+  const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const layersRef = useRef({});
 
-  return (
-    <div style={{ width: "100%", borderRadius: 14, overflow: "hidden", border: "1px solid #221F17", background: "#111017" }}>
-      <svg viewBox={`0 0 ${w} ${height}`} width="100%" height={height} style={{ display: "block" }}>
-        <defs>
-          <pattern id="grid" width="20" height="20" patternUnits="userSpaceOnUse">
-            <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#1C1A22" strokeWidth="1" />
-          </pattern>
-        </defs>
-        <rect width={w} height={height} fill="url(#grid)" />
-        <line x1={pPick.x} y1={pPick.y} x2={pDrop.x} y2={pDrop.y} stroke="#3A3628" strokeWidth="2" strokeDasharray="4 4" />
-        {/* pickup */}
-        <circle cx={pPick.x} cy={pPick.y} r="6" fill="#D9A62E" stroke="#0A0A0B" strokeWidth="2" />
-        <text x={pPick.x + 9} y={pPick.y + 4} fontSize="10" fill="#D9A62E" fontFamily="Inter,sans-serif" fontWeight="700">Retrait</text>
-        {/* dropoff */}
-        <circle cx={pDrop.x} cy={pDrop.y} r="6" fill="#F3F1E9" stroke="#0A0A0B" strokeWidth="2" />
-        <text x={pDrop.x + 9} y={pDrop.y + 4} fontSize="10" fill="#F3F1E9" fontFamily="Inter,sans-serif" fontWeight="700">Livraison</text>
-        {/* live courier */}
-        {pLive && (
-          <g>
-            <circle cx={pLive.x} cy={pLive.y} r="9" fill="#4CC98A" opacity="0.25">
-              <animate attributeName="r" values="7;13;7" dur="1.8s" repeatCount="indefinite" />
-              <animate attributeName="opacity" values="0.35;0.05;0.35" dur="1.8s" repeatCount="indefinite" />
-            </circle>
-            <circle cx={pLive.x} cy={pLive.y} r="6" fill="#4CC98A" stroke="#0A0A0B" strokeWidth="2" />
-          </g>
-        )}
-      </svg>
-    </div>
-  );
+  const pickupPt = ZONES[pickup], dropoffPt = ZONES[dropoff];
+
+  useEffect(() => {
+    if (!containerRef.current || !pickupPt || !dropoffPt || typeof L === "undefined") return;
+
+    if (!mapRef.current) {
+      mapRef.current = L.map(containerRef.current, { zoomControl: true, attributionControl: true });
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      }).addTo(mapRef.current);
+    }
+    const map = mapRef.current;
+
+    Object.values(layersRef.current).forEach((layer) => map.removeLayer(layer));
+    layersRef.current = {};
+
+    const dot = (color, pulse) =>
+      L.divIcon({
+        className: "",
+        html: `<div style="width:16px;height:16px;border-radius:50%;background:${color};border:2px solid #0A0A0B;${pulse ? "animation:delivoPulse 1.8s infinite;" : ""}"></div>`,
+        iconSize: [16, 16],
+        iconAnchor: [8, 8],
+      });
+
+    layersRef.current.pickup = L.marker([pickupPt.lat, pickupPt.lng], { icon: dot("#D9A62E") })
+      .addTo(map)
+      .bindTooltip("Retrait", { permanent: false, direction: "top" });
+    layersRef.current.dropoff = L.marker([dropoffPt.lat, dropoffPt.lng], { icon: dot("#F3F1E9") })
+      .addTo(map)
+      .bindTooltip("Livraison", { permanent: false, direction: "top" });
+
+    const bounds = [[pickupPt.lat, pickupPt.lng], [dropoffPt.lat, dropoffPt.lng]];
+    if (liveLoc) {
+      layersRef.current.live = L.marker([liveLoc.lat, liveLoc.lng], { icon: dot("#4CC98A", true) })
+        .addTo(map)
+        .bindTooltip("Livreur", { permanent: false, direction: "top" });
+      bounds.push([liveLoc.lat, liveLoc.lng]);
+    }
+    map.fitBounds(bounds, { padding: [28, 28] });
+
+    const from = liveLoc || pickupPt;
+    const to = dropoffPt;
+    const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson`;
+    fetch(url)
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.routes && data.routes[0]) {
+          const coords = data.routes[0].geometry.coordinates.map((c) => [c[1], c[0]]);
+          layersRef.current.route = L.polyline(coords, { color: "#D9A62E", weight: 4, opacity: 0.85 }).addTo(map);
+        }
+      })
+      .catch(() => {
+        layersRef.current.route = L.polyline([[from.lat, from.lng], [to.lat, to.lng]], {
+          color: "#D9A62E", weight: 3, dashArray: "6 6", opacity: 0.6,
+        }).addTo(map);
+      });
+  }, [pickup, dropoff, liveLoc && liveLoc.lat, liveLoc && liveLoc.lng]);
+
+  useEffect(() => {
+    return () => {
+      if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; }
+    };
+  }, []);
+
+  if (!pickupPt || !dropoffPt) return null;
+
+  return <div ref={containerRef} style={{ height, borderRadius: 14, overflow: "hidden", border: "1px solid #221F17" }} />;
 }
 
-/* ---------------- Order timeline ---------------- */
 
 function OrderTimeline({ order }) {
   const steps = ["en_attente", "acceptee", "en_cours", "livree"];
